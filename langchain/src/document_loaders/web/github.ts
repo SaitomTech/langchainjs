@@ -1,4 +1,8 @@
 import binaryExtensions from "binary-extensions";
+import { simpleGit, SimpleGit, CleanOptions } from "simple-git";
+import { lstatSync, readFileSync } from "fs";
+import * as glob from "glob";
+import * as path from "path";
 import { Document } from "../../document.js";
 import { BaseDocumentLoader } from "../base.js";
 import { UnknownHandling } from "../fs/directory.js";
@@ -11,20 +15,8 @@ function isBinaryPath(name: string) {
 }
 
 interface GithubFile {
-  name: string;
   path: string;
-  sha: string;
-  size: number;
-  url: string;
-  html_url: string;
-  git_url: string;
-  download_url: string;
-  type: string;
-  _links: {
-    self: string;
-    git: string;
-    html: string;
-  };
+  type: "file" | "dir";
 }
 
 export interface GithubRepoLoaderParams {
@@ -44,8 +36,6 @@ export class GithubRepoLoader
   private readonly repo: string;
 
   private readonly initialPath: string;
-
-  private headers: Record<string, string> = {};
 
   public branch: string;
 
@@ -80,11 +70,6 @@ export class GithubRepoLoader
     this.unknown = unknown;
     this.accessToken = accessToken;
     this.ignoreFiles = ignoreFiles;
-    if (this.accessToken) {
-      this.headers = {
-        Authorization: `Bearer ${this.accessToken}`,
-      };
-    }
   }
 
   private extractOwnerAndRepoAndPath(url: string): {
@@ -105,6 +90,7 @@ export class GithubRepoLoader
 
   public async load(): Promise<Document[]> {
     const documents: Document[] = [];
+    await this.cloneRepo();
     await this.processDirectory(this.initialPath, documents);
     return documents;
   }
@@ -123,12 +109,22 @@ export class GithubRepoLoader
     });
   }
 
+  private async cloneRepo() {
+    const git: SimpleGit = simpleGit().clean(CleanOptions.FORCE);
+    await git.clone(
+      `https://${this.accessToken}@github.com/${this.owner}/${this.repo}`,
+      {
+        "--branch": this.branch,
+      }
+    );
+  }
+
   private async processDirectory(
     path: string,
     documents: Document[]
   ): Promise<void> {
     try {
-      const files = await this.fetchRepoFiles(path);
+      const files = this.fetchRepoFiles(path);
 
       for (const file of files) {
         if (file.type === "dir") {
@@ -137,8 +133,8 @@ export class GithubRepoLoader
           }
         } else {
           try {
-            if (!isBinaryPath(file.name) && !this.shouldIgnore(file.path)) {
-              const fileContent = await this.fetchFileContent(file);
+            if (!isBinaryPath(file.path) && !this.shouldIgnore(file.path)) {
+              const fileContent = this.fetchFileContent(file);
               const metadata = { source: file.path };
               documents.push(
                 new Document({ pageContent: fileContent, metadata })
@@ -156,28 +152,16 @@ export class GithubRepoLoader
     }
   }
 
-  private async fetchRepoFiles(path: string): Promise<GithubFile[]> {
-    const url = `https://api.github.com/repos/${this.owner}/${this.repo}/contents/${path}?ref=${this.branch}`;
-    const response = await fetch(url, { headers: this.headers });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(
-        `Unable to fetch repository files: ${response.status} ${JSON.stringify(
-          data
-        )}`
-      );
-    }
-
-    if (!Array.isArray(data)) {
-      throw new Error("Unable to fetch repository files.");
-    }
-
-    return data as GithubFile[];
+  private fetchRepoFiles(filePath: string): GithubFile[] {
+    const files = glob.sync(`${this.repo}/${filePath}/**/*`, { nodir: false });
+    return files.map((file) => ({
+      path: path.relative(`${this.repo}/${filePath}`, file),
+      type: lstatSync(file).isDirectory() ? "dir" : "file",
+    }));
   }
 
-  private async fetchFileContent(file: GithubFile): Promise<string> {
-    const response = await fetch(file.download_url, { headers: this.headers });
-    return response.text();
+  private fetchFileContent(file: GithubFile): string {
+    return readFileSync(`${this.repo}/${file.path}`, "utf-8");
   }
 
   private handleError(message: string): void {
